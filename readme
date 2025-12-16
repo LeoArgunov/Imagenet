@@ -1,0 +1,18 @@
+Предварительная настройка:
+1) Установить Python 3.11.5
+2) Создать виртуальное окружение
+python -m venv название
+3) Активировать
+название\Scripts\activate
+4) Установить зависимости:
+pip install torch torchvision torchaudio
+pip install pillow matplotlib numpy opencv-python scikit-image
+pip install scikit-learn
+5) Перейти в папку со скриптом и запустить:
+python скрипт.py.
+6) Как запустить:
+- Создайте папку в которой будет:
+- Скрипт.py (программа),
+- Папка val_image (Картинки из датасета ImageNet)
+- Текстовый файл ImageNet_val_label
+- Папка masks

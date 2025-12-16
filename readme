@@ -16,3 +16,6 @@ python скрипт.py.
 - Папка val_image (Картинки из датасета ImageNet)
 - Текстовый файл ImageNet_val_label
 - Папка masks
+
+masks и ImageNet_val_label загружены на гитхаб
+Укороченную версию val_image можно скачать здесь: https://drive.google.com/file/d/1AGNJVzga7-UwB227YDOhZ2NDYzHYxu9N/view?usp=sharing

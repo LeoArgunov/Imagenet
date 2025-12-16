@@ -1,0 +1,353 @@
+import os
+import random
+import torch
+import torch.nn.functional as F
+import torchvision.models as models
+import torchvision.transforms as transforms
+from torch.utils.data import Dataset, DataLoader
+from PIL import Image
+import matplotlib.pyplot as plt
+import numpy as np
+import cv2
+
+# Пути к данным
+VAL_DIR = 'val_images' # Папка с изображениями валидации ImageNet
+LABEL_FILE = 'ImageNet_val_label.txt' # Файл с метками (имя_файла WNID)
+
+# Загрузка меток (WNID для каждого изображения)
+def load_labels(txt_path):
+    labels = {}
+    with open(txt_path, 'r') as f:
+        for line in f:
+            parts = line.strip().split()
+            if len(parts) >= 2:
+                img_name = parts[0]
+                labels[img_name] = parts[1]
+    return labels
+
+labels = load_labels(LABEL_FILE)
+print(f"Загружено меток: {len(labels)}")
+
+# Стандартные трансформации для ImageNet
+transform = transforms.Compose([
+    transforms.Resize(256),
+    transforms.CenterCrop(224),
+    transforms.ToTensor(),
+    transforms.Normalize(mean=[0.485, 0.456, 0.406],
+                         std=[0.229, 0.224, 0.225])
+])
+
+# Кастомный датасет для валидации ImageNet
+class ValDataset(Dataset):
+    def __init__(self, root_dir, labels, transform=None, num_samples=1000):
+        self.root_dir = root_dir
+        self.labels = labels
+        self.transform = transform
+        valid = [f for f in os.listdir(root_dir)
+                 if f.endswith('.JPEG') and f in labels]
+        self.files = random.sample(valid, min(num_samples, len(valid)))
+   
+    def __len__(self): return len(self.files)
+   
+    def __getitem__(self, idx):
+        img_name = self.files[idx]
+        img_path = os.path.join(self.root_dir, img_name)
+        image = Image.open(img_path).convert('RGB')
+        label = self.labels[img_name]
+        if self.transform:
+            image = self.transform(image)
+        return image, label, img_name
+
+# Датасет и лоадер (по умолчанию 1000 изображений)
+dataset = ValDataset(VAL_DIR, labels, transform=transform, num_samples=1000)
+loader = DataLoader(dataset, batch_size=1)
+
+# Устройство и модель
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print(f"Устройство: {device}")
+
+model = models.resnet18(pretrained=True).to(device)
+model.eval()
+
+# GRAD-CAM
+os.makedirs("gradcam_maps", exist_ok=True)
+print("Генерация 1000 Grad-CAM карт...")
+
+activations = None
+gradients   = None
+
+# Хуки для захвата активаций и градиентов
+def forward_hook(module, inp, out):
+    global activations
+    activations = out
+
+def backward_hook(module, grad_in, grad_out):
+    global gradients
+    gradients = grad_out[0]
+
+# Целевой слой — последний conv в ResNet-18
+target_layer = model.layer4[-1].conv2
+fwd = target_layer.register_forward_hook(forward_hook)
+bwd = target_layer.register_full_backward_hook(backward_hook)
+
+for i, (img, label, name) in enumerate(loader):
+    img = img.to(device)
+
+    output = model(img)
+    pred_class = output.argmax(dim=1).item()
+
+    model.zero_grad()
+    output[0, pred_class].backward()
+
+    if gradients is not None and activations is not None:
+        # Взвешенная сумма активаций по градиентам
+        pooled = torch.mean(gradients, dim=[2, 3], keepdim=True)
+        cam = activations * pooled
+        cam = torch.sum(cam, dim=1).squeeze(0)
+        cam = F.relu(cam)
+
+        cam = cam.detach().cpu().numpy()
+
+        cam = (cam - cam.min()) / (cam.max() - cam.min() + 1e-8)
+        cam = cv2.resize(cam, (224, 224))
+        # Денормализация оригинального изображения для визуализации
+        orig = img[0].cpu().detach()
+        mean = torch.tensor([0.485, 0.456, 0.406]).view(3,1,1)
+        std  = torch.tensor([0.229, 0.224, 0.225]).view(3,1,1)
+        orig = std * orig + mean
+        orig = orig.permute(1,2,0).numpy()
+        orig = np.clip(orig, 0, 1)
+        # Оригинал + Grad-CAM
+        plt.figure(figsize=(10,5))
+        plt.subplot(1,2,1)
+        plt.imshow(orig)
+        plt.title(f"{name[0][:20]}...\nПред: {pred_class}")
+        plt.axis('off')
+
+        plt.subplot(1,2,2)
+        plt.imshow(cam, cmap='jet', alpha=0.6)
+        plt.imshow(orig, alpha=0.5)
+        plt.title("Grad-CAM")
+        plt.axis('off')
+
+        plt.savefig(f"gradcam_maps/{i:03d}_{pred_class}.png", bbox_inches='tight')
+        plt.close()
+
+        if (i+1) % 20 == 0:
+            print(f"Готово: {i+1}/1000")
+
+fwd.remove()
+bwd.remove()
+print("Grad-CAM карты сохранены в 'gradcam_maps/'")
+
+
+# Activation Maximization
+os.makedirs("activation_max", exist_ok=True)
+print("Генерация Activation Maximization...")
+
+class Hook:
+    def __init__(self): self.out = None
+    def __call__(self, m, i, o): self.out = o
+
+# Максимизация активации конкретного канала в слое
+def maximize_channel(layer_name, channel, steps=300):
+    layer = None
+    for name, module in model.named_modules():
+        if name == layer_name:
+            layer = module
+            break
+    if layer is None:
+        raise ValueError(f"Слой {layer_name} не найден!")
+   
+    hook = Hook()
+    handle = layer.register_forward_hook(hook)
+   
+    img = torch.randn(1, 3, 224, 224, device=device) * 0.01
+    img = img.clone().detach().requires_grad_(True)
+   
+    opt = torch.optim.Adam([img], lr=0.05)
+    norm = transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+   
+    for step in range(steps):
+        opt.zero_grad()
+        x = norm(img)
+        model(x)
+        if hook.out is not None:
+            loss = -hook.out[0, channel].mean() # максимизируем среднюю активацию канала
+            loss.backward()
+            opt.step()
+       
+        with torch.no_grad():
+            img.clamp_(-3, 3)
+   
+    handle.remove()
+    return img.detach()
+
+# Исследуемые каналы (низкий, средний, глубокий слой)
+targets = [
+    ("conv1", 0),
+    ("layer2.0.conv2", 10),
+    ("layer4.1.conv2", 50)
+]
+
+for layer, ch in targets:
+    print(f"Максимизация: {layer} → канал {ch}")
+    try:
+        synth = maximize_channel(layer, ch)
+        # Денормализация для визуализации
+        img_np = synth.squeeze(0).cpu()
+        mean = torch.tensor([0.485, 0.456, 0.406]).view(3,1,1)
+        std = torch.tensor([0.229, 0.224, 0.225]).view(3,1,1)
+        img_np = std * img_np + mean
+        img_np = img_np.permute(1,2,0).numpy()
+        img_np = np.clip(img_np, 0, 1)
+       
+        plt.figure(figsize=(6,6))
+        plt.imshow(img_np)
+        plt.title(f"{layer} → канал {ch}")
+        plt.axis('off')
+        plt.savefig(f"activation_max/{layer.replace('.', '_')}_ch{ch}.png", bbox_inches='tight')
+        plt.close()
+        print(f" Успешно: activation_max/{layer.replace('.', '_')}_ch{ch}.png")
+    except Exception as e:
+        print(f" ОШИБКА: {e}")
+
+print("Activation Maximization готово!")
+print("Всё готово!")
+
+# Генерация картинок для класса
+print("Генерация картинок для классов (Class-Specific Activation Maximization)...")
+os.makedirs("csam_images", exist_ok=True)
+
+# Генерация изображения, максимизирующего logit конкретного класса
+def generate_class_image(model, class_id, steps=500, lr=0.05, start_type='random'):
+    model.eval()
+    if start_type == 'random':
+        img = torch.randn(1, 3, 224, 224, device=device) * 0.01
+    else: # uniform
+        img = torch.ones(1, 3, 224, 224, device=device) * 0.5 + torch.randn(1, 3, 224, 224, device=device) * 0.01
+    img = img.clone().detach().requires_grad_(True)
+    
+    optimizer = torch.optim.Adam([img], lr=lr)
+    norm = transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+    
+    for step in range(steps):
+        optimizer.zero_grad()
+        x = norm(img)
+        output = model(x)
+        loss = -output[0, class_id] # максимизируем logit класса
+        loss.backward()
+        optimizer.step()
+        with torch.no_grad():
+            img.clamp_(-3, 3)
+    
+    return img.detach().cpu().squeeze(0)
+
+# Класс 207 — golden retriever
+class_ids = [207]
+
+for cls in class_ids:
+    print(f"Генерация для класса {cls} (random start)")
+    img_gen = generate_class_image(model, cls, start_type='random')
+    img_np = img_gen.permute(1,2,0).numpy()
+    img_np = (img_np - img_np.min()) / (img_np.max() - img_np.min() + 1e-8)
+    plt.imshow(img_np)
+    plt.title(f"Class {cls} (random)")
+    plt.axis('off')
+    plt.savefig(f"csam_images/class_{cls}_random.png")
+    plt.close()
+    
+    print(f"Генерация для класса {cls} (uniform start)")
+    img_gen = generate_class_image(model, cls, start_type='uniform')
+    img_np = img_gen.permute(1,2,0).numpy()
+    img_np = (img_np - img_np.min()) / (img_np.max() - img_np.min() + 1e-8)
+    plt.imshow(img_np)
+    plt.title(f"Class {cls} (uniform)")
+    plt.axis('off')
+    plt.savefig(f"csam_images/class_{cls}_uniform.png")
+    plt.close()
+
+print("Картинки для классов сохранены в 'csam_images/'")
+# IoU с масками ImageNet-S300
+print("Расчёт IoU с масками ImageNet-S300...")
+from skimage.io import imread
+from sklearn.metrics import jaccard_score as iou_score
+
+thresholds = [0.2, 0.3, 0.4, 0.5, 0.6]
+iou_per_th = {th: [] for th in thresholds}
+found_masks = 0
+
+cams = []
+
+dataset = ValDataset(VAL_DIR, labels, transform=transform, num_samples=1000)
+loader = DataLoader(dataset, batch_size=1)
+# Пересчёт Grad-CAM
+activations = None
+gradients = None
+
+def forward_hook(module, inp, out):
+    global activations
+    activations = out
+
+def backward_hook(module, grad_in, grad_out):
+    global gradients
+    gradients = grad_out[0]
+
+target_layer = model.layer4[-1].conv2
+fwd = target_layer.register_forward_hook(forward_hook)
+bwd = target_layer.register_full_backward_hook(backward_hook)
+
+for i, (img, label, name) in enumerate(loader):
+    img = img.to(device)
+    output = model(img)
+    pred_class = output.argmax(dim=1).item()
+    model.zero_grad()
+    output[0, pred_class].backward()
+    
+    if gradients is not None and activations is not None:
+        pooled = torch.mean(gradients, dim=[2, 3], keepdim=True)
+        cam = activations * pooled
+        cam = torch.sum(cam, dim=1).squeeze(0)
+        cam = F.relu(cam).detach().cpu().numpy()
+        cam = (cam - cam.min()) / (cam.max() - cam.min() + 1e-8)
+        cam = cv2.resize(cam, (224, 224))
+        cams.append(cam)
+        
+        wnid = label if isinstance(label, str) else label[0]
+        file_base = name[0].replace('.JPEG', '')
+        
+        mask_path = f"masks/{wnid}/{file_base}.png"
+        if not os.path.exists(mask_path):
+            mask_path = f"masks/{wnid}/{file_base}"
+        
+        if os.path.exists(mask_path):
+            found_masks += 1
+            gt_mask = imread(mask_path)
+            if gt_mask.ndim == 3:
+                class_id = gt_mask[:,:,0].astype(np.int64) + gt_mask[:,:,1].astype(np.int64) * 256
+            else:
+                class_id = gt_mask.astype(np.int64)
+            
+            gt_mask = (class_id > 0).astype(np.uint8)
+            # Приводим маску к размеру 224x224
+            gt_mask = cv2.resize(gt_mask, (224, 224)) > 0
+            for th in thresholds:
+                bin_cam = (cam > th).astype(bool)
+                iou = iou_score(gt_mask.flatten(), bin_cam.flatten())
+                iou_per_th[th].append(iou)
+        
+        if (i+1) % 20 == 0:
+            print(f"Обработано {i+1}/1000 (масок: {found_masks})")
+
+fwd.remove()
+bwd.remove()
+
+print(f"Найдено масок: {found_masks}")
+
+for th in thresholds:
+    if iou_per_th[th]:
+        mean_iou = np.mean(iou_per_th[th])
+        print(f"Порог {th}: Средний IoU = {mean_iou:.4f} (на {len(iou_per_th[th])} изображениях)")
+
+print("IoU расчёт завершён!")
+print("ЗАДАЧА 4 ГОТОВА!")

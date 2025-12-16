@@ -10,7 +10,7 @@ pip install pillow matplotlib numpy opencv-python scikit-image
 pip install scikit-learn
 5) Перейти в папку со скриптом и запустить:
 python скрипт.py.
-6) Как запустить:
+6) Чтобы запустилось:
 - Создайте папку в которой будет:
 - Скрипт.py (программа),
 - Папка val_image (Картинки из датасета ImageNet)

@@ -10,6 +10,10 @@ import matplotlib.pyplot as plt
 import numpy as np
 import cv2
 
+random.seed(42)
+torch.manual_seed(42)
+np.random.seed(42)
+
 # Пути к данным
 VAL_DIR = 'val_images' # Папка с изображениями валидации ImageNet
 LABEL_FILE = 'ImageNet_val_label.txt' # Файл с метками (имя_файла WNID)
@@ -39,7 +43,7 @@ transform = transforms.Compose([
 
 # Кастомный датасет для валидации ImageNet
 class ValDataset(Dataset):
-    def __init__(self, root_dir, labels, transform=None, num_samples=1000):
+    def __init__(self, root_dir, labels, transform=None, num_samples=2000):
         self.root_dir = root_dir
         self.labels = labels
         self.transform = transform
@@ -59,7 +63,7 @@ class ValDataset(Dataset):
         return image, label, img_name
 
 # Датасет и лоадер (по умолчанию 1000 изображений)
-dataset = ValDataset(VAL_DIR, labels, transform=transform, num_samples=1000)
+dataset = ValDataset(VAL_DIR, labels, transform=transform, num_samples=2000)
 loader = DataLoader(dataset, batch_size=1)
 
 # Устройство и модель
@@ -71,7 +75,7 @@ model.eval()
 
 # GRAD-CAM
 os.makedirs("gradcam_maps", exist_ok=True)
-print("Генерация 1000 Grad-CAM карт...")
+print("Генерация 2000 Grad-CAM карт...")
 
 activations = None
 gradients   = None
@@ -134,7 +138,7 @@ for i, (img, label, name) in enumerate(loader):
         plt.close()
 
         if (i+1) % 20 == 0:
-            print(f"Готово: {i+1}/1000")
+            print(f"Готово: {i+1}/2000")
 
 fwd.remove()
 bwd.remove()
@@ -279,7 +283,7 @@ found_masks = 0
 
 cams = []
 
-dataset = ValDataset(VAL_DIR, labels, transform=transform, num_samples=1000)
+dataset = ValDataset(VAL_DIR, labels, transform=transform, num_samples=2000)
 loader = DataLoader(dataset, batch_size=1)
 # Пересчёт Grad-CAM
 activations = None
@@ -337,7 +341,7 @@ for i, (img, label, name) in enumerate(loader):
                 iou_per_th[th].append(iou)
         
         if (i+1) % 20 == 0:
-            print(f"Обработано {i+1}/1000 (масок: {found_masks})")
+            print(f"Обработано {i+1}/100 (масок: {found_masks})")
 
 fwd.remove()
 bwd.remove()
@@ -351,3 +355,114 @@ for th in thresholds:
 
 print("IoU расчёт завершён!")
 print("ЗАДАЧА 4 ГОТОВА!")
+
+
+print("\nОценка устойчивости Grad-CAM к аугментациям...")
+
+from torchvision.transforms import functional as TF
+from torchvision.transforms import ColorJitter, GaussianBlur
+
+augmentations = {
+    "original": None,
+    "strong_noise": lambda x: x + torch.randn_like(x) * 0.3,
+    "rotation_30": lambda x: TF.rotate(x, 30),
+    "rotation_minus30": lambda x: TF.rotate(x, -30),
+    "strong_brightness": ColorJitter(brightness=1.0, contrast=1.0),
+    "strong_color": ColorJitter(brightness=0.8, contrast=0.8, saturation=0.8, hue=0.5),
+    "flip": lambda x: TF.hflip(x),
+    "blur": GaussianBlur(kernel_size=5, sigma=(0.1, 2.0)),
+}
+
+results = {name: [] for name in augmentations}
+
+i = 0
+masked_count = 0
+
+for (img, label, name) in loader:
+    if i >= len(cams): break
+    
+    cam_original = cams[i]
+    
+    wnid = label if isinstance(label, str) else label[0]
+    file_base = name[0].replace('.JPEG', '')
+    
+    mask_path = f"masks/{wnid}/{file_base}.png"
+    if not os.path.exists(mask_path):
+        mask_path = f"masks/{wnid}/{file_base}"
+    
+    if os.path.exists(mask_path):
+        masked_count += 1
+        
+        # Маска
+        gt_mask_raw = imread(mask_path)
+        if gt_mask_raw.ndim == 3:
+            class_id = gt_mask_raw[:,:,0].astype(np.int64) + gt_mask_raw[:,:,1].astype(np.int64) * 256
+        else:
+            class_id = gt_mask_raw.astype(np.int64)
+        gt_mask = (class_id > 0).astype(np.uint8)
+        gt_mask = cv2.resize(gt_mask, (224, 224)) > 0
+        
+        # оригинал
+        bin_cam = (cam_original > 0.5).astype(bool)
+        iou = iou_score(gt_mask.flatten(), bin_cam.flatten())
+        results["original"].append(iou)
+        
+        # Аугментации
+        img_tensor = img.clone()
+        for aug_name, aug_func in list(augmentations.items())[1:]:
+            current_img = img_tensor.clone().to(device)
+            
+            if aug_name == "strong_noise":
+                current_img = aug_func(current_img)
+            else:
+                pil_img = transforms.ToPILImage()(current_img.squeeze(0).cpu())
+                aug_pil = aug_func(pil_img)
+                current_img = transforms.ToTensor()(aug_pil).unsqueeze(0).to(device)
+            
+            # Регистрируем хуки для этого прохода
+            activations = None
+            gradients = None
+            
+            fwd = target_layer.register_forward_hook(forward_hook)
+            bwd = target_layer.register_full_backward_hook(backward_hook)
+            
+            output = model(current_img)
+            pred_class = output.argmax(dim=1).item()
+            model.zero_grad()
+            output[0, pred_class].backward()
+            
+            if gradients is not None and activations is not None:
+                pooled = torch.mean(gradients, dim=[2, 3], keepdim=True)
+                cam = activations * pooled
+                cam = torch.sum(cam, dim=1).squeeze(0)
+                cam = F.relu(cam).detach().cpu().numpy()
+                cam = (cam - cam.min()) / (cam.max() - cam.min() + 1e-8)
+                cam = cv2.resize(cam, (224, 224))
+                
+                bin_cam = (cam > 0.5).astype(bool)
+                iou = iou_score(gt_mask.flatten(), bin_cam.flatten())
+                results[aug_name].append(iou)
+            
+            # Убираем хуки
+            fwd.remove()
+            bwd.remove()
+    
+    i += 1
+
+print(f"Найдено {masked_count} изображений с масками для анализа устойчивости")
+
+# Выводим таблицу
+print("\nУстойчивость Grad-CAM (IoU при пороге 0.5):")
+print("-" * 60)
+print(f"{'Аугментация':20} | {'Средний IoU':12} | {'Std':8} | {'Кол-во'}")
+print("-" * 60)
+for name, ious in results.items():
+    if ious:
+        mean = np.mean(ious)
+        std = np.std(ious)
+        count = len(ious)
+        print(f"{name:20} | {mean:.4f}       | {std:.4f}   | {count}")
+    else:
+        print(f"{name:20} | —            | —        | 0")
+print("-" * 60)
+print("Анализ устойчивости завершён!")
